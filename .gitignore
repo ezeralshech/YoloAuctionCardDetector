@@ -1,0 +1,30 @@
+# ── Python envs ──
+venv/
+ls-venv/
+.venv/
+__pycache__/
+*.pyc
+
+# ── Raw & derived data (big, regenerable — keep out of git) ──
+clips/
+clips_new/
+frames/
+frames_new/
+dataset/
+export/
+runs/
+*.zip
+
+# ── Label Studio predictions / exports (derived) ──
+predictions*.json
+pred_*.json
+
+# ── Model weights (binary; versioned in Google Drive — see models/README.md) ──
+*.pt
+*.onnx
+*.mlmodel
+*.tflite
+
+# ── OS cruft ──
+.DS_Store
+Thumbs.db

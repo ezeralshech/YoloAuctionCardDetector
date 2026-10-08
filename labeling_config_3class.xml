@@ -1,0 +1,8 @@
+<View>
+  <Image name="image" value="$image" zoom="true" zoomControl="true"/>
+  <RectangleLabels name="label" toName="image">
+    <Label value="card" background="#22c55e"/>
+    <Label value="label" background="#3b82f6"/>
+    <Label value="slab" background="#a855f7"/>
+  </RectangleLabels>
+</View>
