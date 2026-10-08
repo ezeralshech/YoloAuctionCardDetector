@@ -1,214 +1,147 @@
 #!/usr/bin/env python3
 r"""
-prepare_dataset.py — turn your Label Studio YOLO export + frames into a YOLO
-training dataset, split BY AUCTION (never mixing one auction across splits).
+prepare_dataset.py (3-class) — merge your 1-class and 3-class Label Studio exports
+into one YOLO dataset (card / label / slab), split BY AUCTION.
 
-Why by-auction: the whole point of this project is to know whether the detector
-generalizes to auctions it has NEVER seen. If frames from the same auction land
-in both train and test, the test score is a lie (the model has effectively seen
-that seller/lighting/format). So every split gets WHOLE auctions, never a mix.
+Merge logic:
+  - OLD export (1-class): every box is class 0 = card. For RAW cards that's correct
+    under the 3-class scheme (card = the card). Slab-heavy auctions must be EXCLUDED
+    (their boxes are whole-slab-as-card, which is wrong now) — see EXCLUDE_AUCTIONS.
+  - NEW export (3-class): card/label/slab, used as-is (class ids already line up).
+  - Images are found in any of FRAME_DIRS by the canonical frame name.
 
-What it does:
-  1. Reads every label .txt in export/labels/ (strips the Label Studio hash
-     prefix like "004045ac-" to recover the real frame name).
-  2. Pairs each label with its image in frames/ (the export omits the images;
-     they live in your frames/ folder).
-  3. Assigns each auction to train / val / test per the config below.
-  4. Writes dataset/images/{train,val,test} + dataset/labels/{train,val,test}
-     and a data.yaml. Empty-label frames (your negatives) are carried through
-     as empty .txt files so YOLO learns them as background.
-  5. Prints a summary and refuses to run if any image is missing or if an
-     auction would appear in more than one split.
+Why by-auction: test = whole unseen auctions, so the score reflects generalization.
+NOTE this round: all slabs are in one auction (action07), so it must go in TRAIN —
+slab/label has no held-out test yet. Card is tested honestly on a held-out raw seller.
 
-Run it from the project folder:
     python prepare_dataset.py
-Override the split without editing the file:
-    python prepare_dataset.py --test action05 --val action06
-Rebuild after adding/relabeling (safe — it wipes dataset/ and rebuilds):
-    python prepare_dataset.py
+    python prepare_dataset.py --test action05 --val action09
 """
-import argparse
-import re
-import shutil
-import sys
+import argparse, re, shutil, sys
 from collections import defaultdict
 from pathlib import Path
 
-# ----------------------------------------------------------------------------
-# CONFIG — edit these, or override on the command line.
-# ----------------------------------------------------------------------------
-FRAMES_DIR = Path("frames")            # where sample_frames.py wrote the .jpg frames
-EXPORT_DIR = Path("export")            # the unzipped YOLO export (labels found recursively)
-OUT_DIR = Path("dataset")              # output dataset root (wiped & rebuilt each run)
-FRAME_EXT = ".jpg"
-
-# Which WHOLE auctions are held out. Everything not listed here goes to train.
-# Pick a TEST auction that is a DIFFERENT SELLER from every training auction —
-# that is the honest generalization check. Same for VAL (used for early stopping).
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+EXPORT_DIRS = ["Export", "export_3class"]   # all your export folders (labels read recursively)
+FRAME_DIRS  = ["frames", "frames_new"]       # where the .jpg frames live
+OUT_DIR     = "dataset"
+FRAME_EXT   = ".jpg"
+EXCLUDE_AUCTIONS = ["action06"]              # old slabs mislabeled as card — drop this round
 TEST_AUCTIONS = ["action05"]
-VAL_AUCTIONS = ["action06"]
+VAL_AUCTIONS  = ["action09"]
+CLASS_NAMES = {0: "card", 1: "label", 2: "slab"}
 
-# Recovers the auction id and frame name from any filename, with or without the
-# Label Studio hash prefix. Handles both "action_01" and "action05" styles.
-AUCTION_RE = re.compile(r"(action_?\d+)__\d+")
 FRAMENAME_RE = re.compile(r"(action_?\d+__\d+)")
-# ----------------------------------------------------------------------------
-
-
-def canonical_frame_name(label_stem: str) -> str | None:
-    m = FRAMENAME_RE.search(label_stem)
-    return m.group(1) if m else None
-
-
-def auction_of(name: str) -> str | None:
-    m = AUCTION_RE.search(name)
-    return m.group(1) if m else None
+AUCTION_RE   = re.compile(r"(action_?\d+)__\d+")
+# ────────────────────────────────────────────────────────────────────────────
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--frames", default=str(FRAMES_DIR))
-    ap.add_argument("--export", default=str(EXPORT_DIR),
-                    help="unzipped export root; label .txt files are found recursively")
-    ap.add_argument("--out", default=str(OUT_DIR))
-    ap.add_argument("--test", nargs="*", default=TEST_AUCTIONS,
-                    help="auction ids for the test split")
-    ap.add_argument("--val", nargs="*", default=VAL_AUCTIONS,
-                    help="auction ids for the val split")
+    ap.add_argument("--exports", nargs="*", default=EXPORT_DIRS)
+    ap.add_argument("--frames", nargs="*", default=FRAME_DIRS)
+    ap.add_argument("--out", default=OUT_DIR)
+    ap.add_argument("--exclude", nargs="*", default=EXCLUDE_AUCTIONS)
+    ap.add_argument("--test", nargs="*", default=TEST_AUCTIONS)
+    ap.add_argument("--val", nargs="*", default=VAL_AUCTIONS)
     args = ap.parse_args()
 
-    frames_dir = Path(args.frames)
-    export_dir = Path(args.export)
     out_dir = Path(args.out)
-    test_aucs = set(args.test)
-    val_aucs = set(args.val)
+    test_aucs, val_aucs, excl = set(args.test), set(args.val), set(args.exclude)
+    if test_aucs & val_aucs:
+        sys.exit(f"ERROR: {sorted(test_aucs & val_aucs)} in both test and val.")
 
-    overlap = test_aucs & val_aucs
-    if overlap:
-        sys.exit(f"ERROR: auction(s) {sorted(overlap)} listed in BOTH test and val.")
+    frame_dirs = [Path(d) for d in args.frames if Path(d).is_dir()]
+    if not frame_dirs:
+        sys.exit(f"ERROR: none of these frame dirs exist: {args.frames}")
 
-    if not export_dir.is_dir():
-        sys.exit(f"ERROR: export dir not found: {export_dir}")
-    if not frames_dir.is_dir():
-        sys.exit(f"ERROR: frames dir not found: {frames_dir}")
+    # index every image by canonical name across all frame dirs
+    img_index = {}
+    for fd in frame_dirs:
+        for p in fd.glob(f"*{FRAME_EXT}"):
+            m = FRAMENAME_RE.search(p.stem)
+            if m:
+                img_index.setdefault(m.group(1), p)
 
-    # Find label files anywhere under the export (handles export/labels/,
-    # export/<nested>/labels/, or a flat export/), keeping only real frame
-    # labels — classes.txt and notes.json are skipped by the name pattern.
-    label_files = sorted(p for p in export_dir.rglob("*.txt")
-                         if FRAMENAME_RE.search(p.stem))
-    if not label_files:
-        sys.exit(f"ERROR: no frame label .txt files found under {export_dir}. "
-                 f"Make sure the YOLO export is unzipped there (it should contain "
-                 f"a labels/ folder with files like <hash>-action_01__001680.txt).")
-    print(f"Found {len(label_files)} label files under {export_dir}")
+    # collect labels from all export dirs, keyed by canonical name (dedup)
+    records = {}          # canonical -> (label_path, image_path, auction)
+    dup, missing_img, excluded = [], [], 0
+    for ed in args.exports:
+        edp = Path(ed)
+        if not edp.is_dir():
+            print(f"(skip missing export dir: {ed})"); continue
+        for lf in edp.rglob("*.txt"):
+            m = FRAMENAME_RE.search(lf.stem)
+            if not m:
+                continue                      # classes.txt, notes, etc.
+            canon = m.group(1)
+            auc = AUCTION_RE.search(canon).group(1)
+            if auc in excl:
+                excluded += 1; continue
+            if canon in records:
+                dup.append(canon); continue
+            img = img_index.get(canon)
+            if not img:
+                missing_img.append(canon); continue
+            records[canon] = (lf, img, auc)
 
-    # Build the full table: auction -> list of (label_path, image_path, is_boxed)
-    records = []
-    missing_images = []
-    bad_names = []
-    for lf in label_files:
-        frame = canonical_frame_name(lf.stem)
-        if not frame:
-            bad_names.append(lf.name)
-            continue
-        auc = auction_of(frame)
-        img = frames_dir / f"{frame}{FRAME_EXT}"
-        if not img.exists():
-            missing_images.append(f"{lf.name}  ->  {img}")
-            continue
-        is_boxed = lf.stat().st_size > 0
-        records.append((auc, lf, img, is_boxed))
-
-    if bad_names:
-        print("WARNING: could not parse auction/frame from these labels:")
-        for n in bad_names:
-            print("  ", n)
-
-    if missing_images:
-        print(f"ERROR: {len(missing_images)} label(s) have no matching image in "
-              f"{frames_dir}. First few:")
-        for m in missing_images[:10]:
-            print("  ", m)
-        print("Fix: make sure frames/ holds the same frames you labeled "
-              "(re-run sample_frames.py on all clips), then try again.")
+    if missing_img:
+        print(f"ERROR: {len(missing_img)} labels have no image in {args.frames}. First few:")
+        for c in missing_img[:10]:
+            print("  ", c)
         sys.exit(1)
-
-    all_aucs = sorted({r[0] for r in records})
-    unknown = (test_aucs | val_aucs) - set(all_aucs)
-    if unknown:
-        sys.exit(f"ERROR: test/val auction(s) {sorted(unknown)} not in the data. "
-                 f"Available: {all_aucs}")
+    if dup:
+        print(f"(note: {len(dup)} duplicate frame names across exports — kept first)")
+    print(f"excluded {excluded} labels from {sorted(excl)}")
 
     def split_of(auc):
-        if auc in test_aucs:
-            return "test"
-        if auc in val_aucs:
-            return "val"
-        return "train"
+        return "test" if auc in test_aucs else "val" if auc in val_aucs else "train"
 
-    # Wipe & recreate output tree (clean rebuild every run).
     if out_dir.exists():
         shutil.rmtree(out_dir)
     for sub in ("images", "labels"):
-        for split in ("train", "val", "test"):
-            (out_dir / sub / split).mkdir(parents=True, exist_ok=True)
+        for sp in ("train", "val", "test"):
+            (out_dir / sub / sp).mkdir(parents=True, exist_ok=True)
 
-    # Copy files into their split, using the CANONICAL frame name (hash dropped),
-    # so image and label basenames match exactly as YOLO requires.
-    stats = defaultdict(lambda: {"img": 0, "boxed": 0, "empty": 0,
-                                 "aucs": set(), "boxes": 0})
-    for auc, lf, img, is_boxed in records:
-        split = split_of(auc)
-        frame = canonical_frame_name(lf.stem)
-        shutil.copy2(img, out_dir / "images" / split / f"{frame}{FRAME_EXT}")
-        shutil.copy2(lf, out_dir / "labels" / split / f"{frame}.txt")
-        s = stats[split]
-        s["img"] += 1
-        s["aucs"].add(auc)
-        if is_boxed:
-            s["boxed"] += 1
-            s["boxes"] += sum(1 for ln in lf.read_text().splitlines() if ln.strip())
-        else:
+    stats = defaultdict(lambda: {"img": 0, "empty": 0,
+                                 "card": 0, "label": 0, "slab": 0, "aucs": set()})
+    for canon, (lf, img, auc) in records.items():
+        sp = split_of(auc)
+        shutil.copy2(img, out_dir / "images" / sp / f"{canon}{FRAME_EXT}")
+        shutil.copy2(lf, out_dir / "labels" / sp / f"{canon}.txt")
+        s = stats[sp]; s["img"] += 1; s["aucs"].add(auc)
+        lines = [l for l in lf.read_text().splitlines() if l.strip()]
+        if not lines:
             s["empty"] += 1
+        for l in lines:
+            s[CLASS_NAMES[int(l.split()[0])]] += 1
 
-    # data.yaml — absolute path, forward slashes so it's valid YAML on Windows.
-    data_yaml = out_dir / "data.yaml"
-    data_yaml.write_text(
+    (out_dir / "data.yaml").write_text(
         f"path: {out_dir.resolve().as_posix()}\n"
-        f"train: images/train\n"
-        f"val: images/val\n"
-        f"test: images/test\n"
-        f"nc: 1\n"
-        f"names:\n"
-        f"  0: card\n"
-    )
+        f"train: images/train\nval: images/val\ntest: images/test\n"
+        f"nc: 3\nnames:\n  0: card\n  1: label\n  2: slab\n")
 
-    # Summary
-    print("\n" + "=" * 64)
-    print("DATASET BUILT  ->", out_dir.resolve())
-    print("=" * 64)
-    for split in ("train", "val", "test"):
-        s = stats[split]
-        aucs = ", ".join(sorted(s["aucs"])) or "(none)"
-        print(f"{split:5}  images={s['img']:4}  boxed={s['boxed']:4}  "
-              f"empty={s['empty']:4}  boxes={s['boxes']:4}  | auctions: {aucs}")
-    total = sum(stats[s]["img"] for s in ("train", "val", "test"))
-    print("-" * 64)
-    print(f"total images: {total}")
-    print(f"data.yaml:    {data_yaml.resolve()}")
-
-    # Leakage guard: no auction in more than one split.
+    print("\n" + "=" * 72)
+    print("DATASET BUILT ->", out_dir.resolve())
+    print("=" * 72)
+    hdr = f"{'split':5} {'imgs':>5} {'empty':>6} {'card':>5} {'label':>6} {'slab':>5}  auctions"
+    print(hdr)
+    for sp in ("train", "val", "test"):
+        s = stats[sp]
+        print(f"{sp:5} {s['img']:5} {s['empty']:6} {s['card']:5} {s['label']:6} "
+              f"{s['slab']:5}  {', '.join(sorted(s['aucs'])) or '(none)'}")
+    # leakage guard
     placement = defaultdict(set)
-    for auc, lf, img, is_boxed in records:
+    for _, (_, _, auc) in records.items():
         placement[auc].add(split_of(auc))
-    leaked = {a: sorted(sp) for a, sp in placement.items() if len(sp) > 1}
+    leaked = {a: sorted(v) for a, v in placement.items() if len(v) > 1}
     if leaked:
-        print("\nERROR: auction(s) span multiple splits (leakage!):", leaked)
-        sys.exit(1)
-    print("\nOK: every auction is confined to a single split (no leakage).")
-    if stats["val"]["img"] == 0 or stats["test"]["img"] == 0:
-        print("WARNING: val or test split is empty — check your --val / --test ids.")
+        sys.exit(f"\nERROR: auctions span splits (leakage): {leaked}")
+    print("\nOK: no auction spans multiple splits.")
+    if stats["train"]["slab"] == 0:
+        print("WARNING: no slabs in TRAIN — the model can't learn slab/label.")
+    if stats["test"]["slab"] == 0:
+        print("NOTE: no slabs in TEST — slab/label is train-only this round (expected).")
 
 
 if __name__ == "__main__":

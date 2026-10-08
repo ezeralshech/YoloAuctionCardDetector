@@ -28,3 +28,4 @@ pred_*.json
 # ── OS cruft ──
 .DS_Store
 Thumbs.db
+export_3class/
